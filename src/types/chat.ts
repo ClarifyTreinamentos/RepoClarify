@@ -16,6 +16,8 @@ export type Message = {
   text: string;
   // Data de envio em milissegundos (Date.now())
   sentAt: number;
+  // Mensagem de falha do atendimento: aparece em balão avermelhado e não vai para a API
+  isError?: boolean;
 };
 
 export type Conversation = {

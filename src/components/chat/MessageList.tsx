@@ -12,10 +12,12 @@ type MessageListProps = {
 // Lista de mensagens da conversa; rola sozinha até a última mensagem
 export function MessageList({ messages, isAgentTyping }: MessageListProps) {
   const endRef = useRef<HTMLDivElement>(null);
+  // Tamanho do texto da última mensagem: muda a cada pedaço recebido em streaming
+  const lastMessageLength = messages.at(-1)?.text.length ?? 0;
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
-  }, [messages.length, isAgentTyping]);
+  }, [messages.length, lastMessageLength, isAgentTyping]);
 
   return (
     <div className="flex-1 overflow-y-auto px-4 py-6" aria-live="polite">

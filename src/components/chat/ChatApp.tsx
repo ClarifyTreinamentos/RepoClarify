@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { createId } from "@/lib/create-id";
-import { createSampleConversations } from "@/lib/sample-conversations";
+import { streamChatReply, type ChatApiMessage } from "@/lib/chat-stream";
 import type { Conversation, Message, MessageAuthor } from "@/types/chat";
 import { ChatHeader } from "./ChatHeader";
 import { EmptyState } from "./EmptyState";
@@ -10,17 +10,40 @@ import { MessageInput } from "./MessageInput";
 import { MessageList } from "./MessageList";
 import { Sidebar } from "./Sidebar";
 
-// Resposta fixa enquanto o chatbot ainda não tem inteligência artificial
-const PLACEHOLDER_REPLY =
-  "Ainda estou aprendendo a responder. No Dia 4 eu ganho um cérebro!";
-const REPLY_DELAY_MS = 500;
 const NEW_CONVERSATION_TITLE = "Nova conversa";
 const TITLE_MAX_LENGTH = 50;
 // De quanto em quanto tempo o "há X min" da lista é atualizado
 const CLOCK_INTERVAL_MS = 30 * 1000;
 
-function createMessage(author: MessageAuthor, text: string): Message {
-  return { id: createId("msg"), author, text, sentAt: Date.now() };
+function createMessage(
+  author: MessageAuthor,
+  text: string,
+  isError = false,
+): Message {
+  return { id: createId("msg"), author, text, sentAt: Date.now(), isError };
+}
+
+function createEmptyConversation(): Conversation {
+  return {
+    id: createId("conversa"),
+    customerName: "Visitante",
+    customerEmail: null,
+    title: NEW_CONVERSATION_TITLE,
+    category: null,
+    createdAt: Date.now(),
+    messages: [],
+  };
+}
+
+// Converte o histórico da tela para o formato da /api/chat.
+// Balões de erro são só avisos da tela e não fazem parte da conversa.
+function toApiMessages(messages: Message[]): ChatApiMessage[] {
+  return messages
+    .filter((message) => !message.isError)
+    .map((message) => ({
+      role: message.author === "user" ? "user" : "assistant",
+      content: message.text,
+    }));
 }
 
 function getLastActivity(conversation: Conversation): number {
@@ -37,9 +60,9 @@ function titleFromText(text: string): string {
 
 // Tela completa do chatbot: lista de conversas à esquerda e conversa aberta à direita
 export function ChatApp() {
-  const [conversations, setConversations] = useState<Conversation[]>(() =>
-    createSampleConversations(Date.now()),
-  );
+  const [conversations, setConversations] = useState<Conversation[]>(() => [
+    createEmptyConversation(),
+  ]);
   const [activeConversationId, setActiveConversationId] = useState<
     string | null
   >(() => conversations[0]?.id ?? null);
@@ -50,7 +73,8 @@ export function ChatApp() {
   );
   // "Agora" só é definido no navegador, para o servidor e o navegador renderizarem o mesmo HTML
   const [now, setNow] = useState<number | null>(null);
-  const replyTimeoutsRef = useRef<number[]>([]);
+  // Pedidos à /api/chat em andamento, para cancelar se a tela for desmontada
+  const pendingRequestsRef = useRef<Set<AbortController>>(new Set());
 
   useEffect(() => {
     setNow(Date.now());
@@ -63,8 +87,8 @@ export function ChatApp() {
 
   // Cancela respostas pendentes se a tela for desmontada
   useEffect(() => {
-    const timeouts = replyTimeoutsRef.current;
-    return () => timeouts.forEach((timeout) => window.clearTimeout(timeout));
+    const pendingRequests = pendingRequestsRef.current;
+    return () => pendingRequests.forEach((controller) => controller.abort());
   }, []);
 
   // Fecha a gaveta do celular com a tecla Esc
@@ -93,6 +117,9 @@ export function ChatApp() {
   const isAgentTyping =
     activeConversation !== null &&
     typingConversationIds.includes(activeConversation.id);
+  // "digitando..." some assim que o primeiro pedaço da resposta aparece
+  const showTypingIndicator =
+    isAgentTyping && activeConversation.messages.at(-1)?.author !== "agent";
 
   function appendMessage(conversationId: string, message: Message) {
     setConversations((current) =>
@@ -112,22 +139,69 @@ export function ChatApp() {
     );
   }
 
-  function handleSend(text: string) {
+  function updateMessageText(
+    conversationId: string,
+    messageId: string,
+    text: string,
+  ) {
+    setConversations((current) =>
+      current.map((conversation) =>
+        conversation.id !== conversationId
+          ? conversation
+          : {
+              ...conversation,
+              messages: conversation.messages.map((message) =>
+                message.id === messageId ? { ...message, text } : message,
+              ),
+            },
+      ),
+    );
+  }
+
+  async function handleSend(text: string) {
     if (!activeConversation || isAgentTyping) return;
     const conversationId = activeConversation.id;
+    const userMessage = createMessage("user", text);
+    // Histórico inteiro da conversa, incluindo a mensagem que acabou de ser enviada
+    const history = toApiMessages([...activeConversation.messages, userMessage]);
 
-    appendMessage(conversationId, createMessage("user", text));
+    appendMessage(conversationId, userMessage);
     setNow(Date.now());
     setTypingConversationIds((current) => [...current, conversationId]);
 
-    const timeout = window.setTimeout(() => {
-      appendMessage(conversationId, createMessage("agent", PLACEHOLDER_REPLY));
-      setTypingConversationIds((current) =>
-        current.filter((id) => id !== conversationId),
-      );
-      setNow(Date.now());
-    }, REPLY_DELAY_MS);
-    replyTimeoutsRef.current.push(timeout);
+    const controller = new AbortController();
+    pendingRequestsRef.current.add(controller);
+
+    // A mensagem do atendente só é criada quando chega o primeiro pedaço de texto
+    let replyId: string | null = null;
+    let replyText = "";
+
+    await streamChatReply(
+      history,
+      {
+        onText: (chunk) => {
+          replyText += chunk;
+          if (replyId === null) {
+            const reply = createMessage("agent", replyText);
+            replyId = reply.id;
+            appendMessage(conversationId, reply);
+          } else {
+            updateMessageText(conversationId, replyId, replyText);
+          }
+        },
+        onError: (message) => {
+          appendMessage(conversationId, createMessage("agent", message, true));
+        },
+      },
+      controller.signal,
+    );
+
+    pendingRequestsRef.current.delete(controller);
+    if (controller.signal.aborted) return;
+    setTypingConversationIds((current) =>
+      current.filter((id) => id !== conversationId),
+    );
+    setNow(Date.now());
   }
 
   function handleNewConversation() {
@@ -139,15 +213,7 @@ export function ChatApp() {
     if (emptyConversation) {
       setActiveConversationId(emptyConversation.id);
     } else {
-      const conversation: Conversation = {
-        id: createId("conversa"),
-        customerName: "Visitante",
-        customerEmail: null,
-        title: NEW_CONVERSATION_TITLE,
-        category: null,
-        createdAt: Date.now(),
-        messages: [],
-      };
+      const conversation = createEmptyConversation();
       setConversations((current) => [conversation, ...current]);
       setActiveConversationId(conversation.id);
       setNow(Date.now());
@@ -186,7 +252,7 @@ export function ChatApp() {
         {hasMessages ? (
           <MessageList
             messages={activeConversation.messages}
-            isAgentTyping={isAgentTyping}
+            isAgentTyping={showTypingIndicator}
           />
         ) : (
           <EmptyState
